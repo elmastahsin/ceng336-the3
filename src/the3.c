@@ -11,7 +11,7 @@
 #include "pragmas.h"
 #include "cabinet.h"
 
-#define _XTAL_FREQ 40000000UL
+/* _XTAL_FREQ pragmas.h icinde zaten tanimli */
 #define RB_SIZE 64u     /* S.67: en az 32 byte; 64 fazlasiyla yeterli */
 
 /* ======================================================================
