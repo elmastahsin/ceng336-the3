@@ -32,12 +32,12 @@ static uint8_t rb_next(uint8_t index) {
     return index;
 }
 static uint8_t rb_is_empty(volatile ByteRing *rb) { return rb->head == rb->tail; }
+static uint8_t rb_is_full(volatile ByteRing *rb) { return rb_next(rb->head) == rb->tail; }
 
 static uint8_t rb_push(volatile ByteRing *rb, uint8_t value) {
-    uint8_t next = rb_next(rb->head);
-    if (next == rb->tail) return 0;          /* dolu - byte dusuruluyor */
+    if (rb_is_full(rb)) return 0;            /* dolu - byte dusuruluyor */
     rb->data[rb->head] = value;
-    rb->head = next;
+    rb->head = rb_next(rb->head);
     return 1;
 }
 static uint8_t rb_pop(volatile ByteRing *rb, uint8_t *value) {
@@ -46,6 +46,8 @@ static uint8_t rb_pop(volatile ByteRing *rb, uint8_t *value) {
     rb->tail = rb_next(rb->tail);
     return 1;
 }
+
+uint8_t uart_rx_available(void) { return !rb_is_empty(&rx_ring); }
 
 uint8_t uart_read_byte(uint8_t *value) { return rb_pop(&rx_ring, value); }
 
@@ -363,8 +365,9 @@ void main(void) {
 
     for (;;) {
         /* Gelen byte'lari parser'a besle */
-        uint8_t byte;
-        while (uart_read_byte(&byte)) {
+        while (uart_rx_available()) {
+            uint8_t byte;
+            uart_read_byte(&byte);
             parser_feed(byte);
         }
 
