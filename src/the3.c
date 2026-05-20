@@ -139,6 +139,8 @@ static void dispatch_frame(uint8_t *body, uint8_t len) {
             cab_state = ST_ACTIVE;
             ack_pending = 1; ack_code = 0;
             adc_div = 0;
+            display_page   = 0;   /* S.40/S.54: GO'da sayfa 0 */
+            display_active = 1;   /* S.38: ACTIVE'de ekran calisir */
             adc_start_conversion();
             cabinet_tick_init();
         }
@@ -149,6 +151,7 @@ static void dispatch_frame(uint8_t *body, uint8_t len) {
             cab_state = ST_END;
             T0CONbits.TMR0ON = 0;
             INTCONbits.TMR0IE = 0;
+            display_active = 0;   /* S.37: END'de ekran blank */
             display_blank();
         }
         return;
