@@ -304,13 +304,16 @@ static void cabinet_tick(void) {
 void __interrupt() isr(void) {
     /* --- EUSART RX --- */
     if (PIE1bits.RC1IE && PIR1bits.RC1IF) {
-        /* S.65: OERR/FERR sessiz kurtarma - hatali byte'i at, CREN cevir */
-        if (RCSTA1bits.OERR) {
+        /* S.65: OERR/FERR sessiz kurtarma. FERR biti RCREG okunmadan
+         * ONCE okunmali (okuma FERR'i temizler). */
+        uint8_t ferr = RCSTA1bits.FERR;
+        if (RCSTA1bits.OERR) {          /* overrun: CREN cevir, FIFO bosalt */
             RCSTA1bits.CREN = 0;
             RCSTA1bits.CREN = 1;
         }
-        uint8_t byte = RCREG1;          /* RCREG okumasi FERR'i de temizler */
-        if (cab_state != ST_END) {      /* S.5: END'den sonra frame'leri yok say */
+        uint8_t byte = RCREG1;          /* okuma FERR'i de temizler */
+        /* framing error'lu byte at; S.5: END sonrasi frame'leri yok say */
+        if (!ferr && cab_state != ST_END) {
             (void)rb_push(&rx_ring, byte);
         }
     }
