@@ -6,6 +6,8 @@
                    projectFiles="true">
       <itemPath>../src/cabinet.h</itemPath>
       <itemPath>../src/pragmas.h</itemPath>
+      <itemPath>../src/thermal.h</itemPath>
+      <itemPath>../src/display.h</itemPath>
     </logicalFolder>
     <logicalFolder name="LinkerScript"
                    displayName="Linker Files"
@@ -17,6 +19,8 @@
       <logicalFolder name="f1" displayName="New Folder 1" projectFiles="true">
       </logicalFolder>
       <itemPath>../src/the3.c</itemPath>
+      <itemPath>../src/thermal.c</itemPath>
+      <itemPath>../src/display.c</itemPath>
     </logicalFolder>
     <logicalFolder name="ExternalFiles"
                    displayName="Important Files"

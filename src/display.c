@@ -1,30 +1,17 @@
 #include <xc.h>
 #include <stdint.h>
+#include "cabinet.h"   // shared CabState enum and cab_state
 #include "display.h"
 
-
-// NOTE:
-// In the final integrated project, CabState should be defined only once
-// in a shared header such as common.h. This local definition is only here
-// so that this module can be developed separately for now.
-typedef enum {
-    ST_WAITING,
-    ST_ACTIVE,
-    ST_END
-} CabState;
-
-// These variables are owned by the main cabinet/state modules.
-// This display module only reads or updates them through extern declarations.
-// In the final project, make sure they are defined exactly once elsewhere.
-extern volatile CabState cab_state;
+// cab_state comes from cabinet.h. adc_last, connected_mask and
+// limit_effective() are owned by thermal.c, read here via extern.
 extern volatile uint16_t adc_last;
 extern volatile uint8_t connected_mask;
-extern volatile uint8_t display_page;
-extern volatile uint8_t rb6_release_flag;
-
-// Provided by the current-limit / thermal module.
-// Expected return values are 0, 8, 16, or 24.
 extern uint8_t limit_effective(void);
+
+// Owned by this display module (single definition here).
+volatile uint8_t display_page = 0;
+volatile uint8_t rb6_release_flag = 0;
 
 #define SEG_BLANK 0x00
 

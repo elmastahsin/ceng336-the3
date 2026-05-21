@@ -128,12 +128,12 @@ void adc_init(void)
 {
     TRISHbits.TRISH4 = 1;       /* RH4: high-Z input                    */
 
-    ANCON1 &= ~0x10u;           /* AN12 analog enable (bit 4 = 0)       */
-
     /* Channel AN12, no conversion, module on */
     ADCON0 = 0b00110001;        /* CHS=1100(AN12), GO=0, ADON=1         */
 
-    /* Vref- = AVss, Vref+ = AVdd */
+    /* PIC18F8722: ADCON1 PCFG3:0 = 0000 -> AN0..AN12 hepsi analog
+     * (AN12 analog secimi burada yapilir; ANCON ailesi bu chip'te yok).
+     * VCFG1:0 = 00 -> Vref- = AVss, Vref+ = AVdd. */
     ADCON1 = 0x00u;
 
     /* Right-justified, 20 TAD acquisition, Fosc/64 clock */

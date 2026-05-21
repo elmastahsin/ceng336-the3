@@ -3,13 +3,16 @@
  * Uye A: Parser + State Machine + Tick + EUSART + Integration
  *
  * Ring buffer ve ISR icindeki RX/TX byte enqueue/dequeue iskeleti
- * the3_template.c'den alinmistir.
+ * the3_template.c'den alinmistir. ADC/thermal -> thermal.c (Uye B),
+ * display/RB6 -> display.c (Uye C).
  */
 #include <xc.h>
 #include <stdint.h>
 #include <stdio.h>
 #include "pragmas.h"
 #include "cabinet.h"
+#include "thermal.h"
+#include "display.h"
 
 #define RB_SIZE 64u
 
@@ -59,9 +62,8 @@ uint8_t uart_write_byte(uint8_t value) {
 /* ======================================================================
  * 2) GLOBAL STATE  (sahip: Uye A)
  * ====================================================================== */
-volatile CabState cab_state      = ST_WAITING;
-volatile uint8_t  connected_mask = 0;
-volatile uint8_t  tick_flag      = 0;
+volatile CabState cab_state = ST_WAITING;
+static volatile uint8_t tick_flag = 0;
 
 /* Pending in-run komut: bir sonraki tick'te uygulanir (S.48).
  * Simulator iki tick arasi en fazla 1 komut yollar -> tek slot yeterli. */
@@ -71,8 +73,6 @@ static volatile uint8_t  pend_arg  = 0;
 
 static volatile uint8_t ack_pending = 0;
 static volatile uint8_t ack_code    = 0;
-
-static uint8_t adc_div = 0;
 
 /* ======================================================================
  * 3) EUSART INIT  (115200 8N1, RC6/RC7)
@@ -138,20 +138,19 @@ static void dispatch_frame(uint8_t *body, uint8_t len) {
         if (cab_state == ST_WAITING) {
             cab_state = ST_ACTIVE;
             ack_pending = 1; ack_code = 0;
-            adc_div = 0;
-            display_page   = 0;   /* S.40/S.54: GO'da sayfa 0 */
-            display_active = 1;   /* S.38: ACTIVE'de ekran calisir */
-            adc_start_conversion();
-            cabinet_tick_init();
+            thermal_reset();            /* B: requested_limit/mask/band sifirla */
+            display_page      = 0;      /* S.40/S.54: GO'da sayfa 0 */
+            rb6_release_flag  = 0;      /* WAITING'de birikmis press'i at */
+            adc_start_conversion();     /* S.15/S.56: cold-start ADC */
+            cabinet_tick_init();        /* S.46: ilk tick 100 ms sonra */
         }
         return;
     }
     if (len == 3 && body[0]=='E' && body[1]=='N' && body[2]=='D') {
         if (cab_state == ST_ACTIVE) {
             cab_state = ST_END;
-            T0CONbits.TMR0ON = 0;
+            T0CONbits.TMR0ON  = 0;
             INTCONbits.TMR0IE = 0;
-            display_active = 0;   /* S.37: END'de ekran blank */
             display_blank();
         }
         return;
@@ -211,10 +210,16 @@ static void send_ack(uint8_t code) {
 
 static void send_sts(void) {
     char buf[16];
-    uint8_t ee = limit_effective();
+    uint16_t adc;
+
+    /* adc_last 16-bit; ADC ISR'ye karsi atomik oku (thermal.h notu) */
+    PIE1bits.ADIE = 0;
+    adc = adc_last;
+    PIE1bits.ADIE = 1;
+
     sprintf(buf, "$STS%c%04u%u%02u#",
-            thermal_band, (unsigned)adc_last,
-            (unsigned)(connected_mask & 0x07), (unsigned)ee);
+            thermal_mode, (unsigned)adc,
+            (unsigned)(connected_mask & 0x07), (unsigned)limit_effective());
     for (uint8_t i = 0; buf[i]; i++) uart_write_byte((uint8_t)buf[i]);
 }
 
@@ -253,23 +258,16 @@ static void cabinet_tick(void) {
     }
     pend_kind = CMD_NONE;
 
-    if (adc_done_flag) {
-        thermal_process();
-        adc_done_flag = 0;
-    }
-
-    display_update_buffer();
+    thermal_update();           /* B: yeni ADC sonucunu banda cevir */
+    adc_tick();                 /* B: 500 ms cadence sayaci */
+    display_process_button();   /* C: RB6 release -> sayfa toggle */
+    display_update_buffer();    /* C: aktif sayfayi buffer'a yaz */
 
     if (ack_pending) {
         send_ack(ack_code);
         ack_pending = 0;
     } else {
         send_sts();
-    }
-
-    if (++adc_div >= 5) {   /* 500 ms = her 5. tick */
-        adc_div = 0;
-        adc_start_conversion();
     }
 }
 
@@ -303,6 +301,17 @@ void __interrupt() isr(void) {
         }
     }
 
+    /* --- ADC tamamlandi (Uye B) --- */
+    if (PIE1bits.ADIE && PIR1bits.ADIF) {
+        /* Sag-hizali sonuc: ADRESL once okunmali (donanim ADRESH'i
+         * ADRESL okunana kadar dondurur). */
+        uint8_t lo = ADRESL;
+        uint8_t hi = ADRESH & 0x03u;
+        adc_last  = (uint16_t)lo | ((uint16_t)hi << 8u);
+        adc_ready = 1u;
+        PIR1bits.ADIF = 0;
+    }
+
     /* --- Timer0: 100 ms tick --- */
     if (INTCONbits.TMR0IE && INTCONbits.TMR0IF) {
         TMR0H = T0_RELOAD_H;
@@ -311,11 +320,15 @@ void __interrupt() isr(void) {
         tick_flag = 1;
     }
 
-    /* BAGIMLILIK - Uye B: ADIF/ADIE branch'ini buraya ekleyecek;
-     * ADRES'i adc_last'a yazip adc_done_flag = 1 yapacak. */
+    /* --- Timer1: display multiplex (Uye C) --- */
+    if (PIE1bits.TMR1IE && PIR1bits.TMR1IF) {
+        display_timer1_handler();   /* TMR1IF'i kendi temizler */
+    }
 
-    /* BAGIMLILIK - Uye C: RBIF branch'ini buraya ekleyecek; RB6 release
-     * (rising) edge'i yakalayip display_page'i toggle edecek. */
+    /* --- RB6 interrupt-on-change (Uye C) --- */
+    if (INTCONbits.RBIE && INTCONbits.RBIF) {
+        rb6_ioc_handler();          /* RBIF'i kendi temizler */
+    }
 }
 
 /* ======================================================================
@@ -323,12 +336,13 @@ void __interrupt() isr(void) {
  * ====================================================================== */
 void main(void) {
     eusart_init();
-    adc_init();          /* B */
-    rb6_ioc_init();      /* C */
-    display_init();      /* C */
+    adc_init();             /* B */
+    display_init();         /* C */
+    timer1_display_init();  /* C */
+    rb6_ioc_init();         /* C */
     /* cabinet_tick_init() $GO# kabul edilince cagrilir */
 
-    RCONbits.IPEN   = 0;   /* tek seviyeli interrupt */
+    RCONbits.IPEN   = 0;    /* tek seviyeli interrupt */
     INTCONbits.PEIE = 1;
     INTCONbits.GIE  = 1;
 
@@ -343,30 +357,4 @@ void main(void) {
             cabinet_tick();
         }
     }
-}
-
-/* ======================================================================
- * 10) GECICI STUB'LAR  -  ENTEGRASYONDA SILINECEK
- * Uye B (adc.c) ve Uye C (display.c) kendi dosyalarini ekleyince bu blok
- * kaldirilir. Su an A'nin branch'i tek basina derlensin diye konuldu.
- * ====================================================================== */
-volatile uint16_t adc_last        = 0;
-volatile char     thermal_band    = 'N';
-volatile uint8_t  thermal_cap     = 24;
-volatile uint8_t  requested_limit = 0;
-volatile uint8_t  adc_done_flag   = 0;
-volatile uint8_t  display_page    = 0;
-volatile uint8_t  display_active  = 0;
-
-void adc_init(void)             { }
-void adc_start_conversion(void) { }
-void rb6_ioc_init(void)         { }
-void display_init(void)         { }
-void thermal_process(void)      { }
-void display_update_buffer(void){ }
-void display_blank(void)        { }
-
-uint8_t limit_effective(void) {
-    uint8_t r = requested_limit, c = thermal_cap;
-    return (r < c) ? r : c;
 }
