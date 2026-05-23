@@ -1,10 +1,19 @@
 /*
- * CENG336 THE3 - Three-Port EV Charging Cabinet
- * Uye A: Parser + State Machine + Tick + EUSART + Integration
+ * CENG 336 THE3 optional starter template.
  *
- * Ring buffer ve ISR icindeki RX/TX byte enqueue/dequeue iskeleti
- * the3_template.c'den alinmistir. ADC/thermal -> thermal.c (Uye B),
- * display/RB6 -> display.c (Uye C).
+ * Provided here:
+ *   - byte-level RX/TX ring buffers
+ *   - interrupt-side EUSART byte enqueue/dequeue structure
+ *
+ * Left to you, and graded:
+ *   - EUSART register setup for 115200 8N1 on RC6/RC7
+ *   - timer configuration and 100 ms cabinet tick generation
+ *   - ADC setup, sampling, and thermal-band classification
+ *   - all protocol logic: frame parsing, ACK/STS construction, lifecycle
+ *   - RB6 interrupt-on-change handling and 7-segment display driving
+ *
+ * You may use this file, ignore it, or rewrite it. Grading is based on
+ * the externally visible behavior in the THE3 specification.
  */
 #include <xc.h>
 #include <stdint.h>
@@ -16,9 +25,7 @@
 
 #define RB_SIZE 64u
 
-/* ======================================================================
- * 1) RING BUFFER
- * ====================================================================== */
+/* ---- 1) Ring buffer ---- */
 typedef struct {
     volatile uint8_t head;
     volatile uint8_t tail;
@@ -55,18 +62,14 @@ uint8_t uart_read_byte(uint8_t *value) { return rb_pop(&rx_ring, value); }
 
 uint8_t uart_write_byte(uint8_t value) {
     if (!rb_push(&tx_ring, value)) return 0;
-    PIE1bits.TX1IE = 1;   /* TX interrupt yalnizca kuyrukta veri varken acik */
+    PIE1bits.TX1IE = 1;   /* TX IE yalnizca kuyrukta veri varken acik */
     return 1;
 }
 
-/* ======================================================================
- * 2) GLOBAL STATE  (sahip: Uye A)
- * ====================================================================== */
+/* ---- 2) Global state ---- */
 volatile CabState cab_state = ST_WAITING;
 static volatile uint8_t tick_flag = 0;
 
-/* Pending in-run komut: bir sonraki tick'te uygulanir (S.48).
- * Simulator iki tick arasi en fazla 1 komut yollar -> tek slot yeterli. */
 typedef enum { CMD_NONE, CMD_CON, CMD_DIS, CMD_LIM } PendKind;
 static volatile PendKind pend_kind = CMD_NONE;
 static volatile uint8_t  pend_arg  = 0;
@@ -74,14 +77,12 @@ static volatile uint8_t  pend_arg  = 0;
 static volatile uint8_t ack_pending = 0;
 static volatile uint8_t ack_code    = 0;
 
-/* ======================================================================
- * 3) EUSART INIT  (115200 8N1, RC6/RC7)
- * ====================================================================== */
+/* ---- 3) EUSART (115200 8N1, RC6/RC7) ---- */
 void eusart_init(void) {
     TRISCbits.TRISC6 = 1;
     TRISCbits.TRISC7 = 1;
 
-    /* BRG16=1, BRGH=1: baud = Fosc/(4*(SPBRG+1)); SPBRG=86 -> ~115200 */
+    /* BRG16=1+BRGH=1: baud=Fosc/(4*(SPBRG+1)); SPBRG=86 -> ~115200 */
     BAUDCON1bits.BRG16 = 1;
     TXSTA1bits.BRGH    = 1;
     SPBRGH1 = 0;
@@ -96,11 +97,8 @@ void eusart_init(void) {
     PIE1bits.TX1IE = 0;
 }
 
-/* ======================================================================
- * 4) TIMER0 - 100 ms cabinet tick
- * ====================================================================== */
-/* Fosc/4=10MHz, prescaler 1:64 -> 156250Hz; 100ms=15625 sayim
- * preload = 65536-15625 = 0xC2F7 */
+/* ---- 4) Timer0 - 100 ms cabinet tick ----
+ * Fosc/4=10MHz, ps 1:64 -> 156250Hz; 100ms=15625; preload=0xC2F7 */
 #define T0_RELOAD_H 0xC2
 #define T0_RELOAD_L 0xF7
 
@@ -108,19 +106,17 @@ void cabinet_tick_init(void) {
     T0CONbits.T08BIT = 0;
     T0CONbits.T0CS   = 0;
     T0CONbits.PSA    = 0;
-    T0CONbits.T0PS2  = 1;   /* 101 -> 1:64 prescaler */
+    T0CONbits.T0PS2  = 1;   /* 101 -> 1:64 */
     T0CONbits.T0PS1  = 0;
     T0CONbits.T0PS0  = 1;
-    TMR0H = T0_RELOAD_H;    /* 16-bit yazimda once H, sonra L commit eder */
+    TMR0H = T0_RELOAD_H;
     TMR0L = T0_RELOAD_L;
     INTCONbits.TMR0IF = 0;
     INTCONbits.TMR0IE = 1;
     T0CONbits.TMR0ON  = 1;
 }
 
-/* ======================================================================
- * 5) FRAME PARSER  ($...#)
- * ====================================================================== */
+/* ---- 5) Frame parser ($...#) ---- */
 #define FRAME_MAX 8
 static uint8_t frame_buf[FRAME_MAX];
 static uint8_t frame_len  = 0;
@@ -131,18 +127,17 @@ static void queue_in_run(PendKind k, uint8_t arg) {
     pend_arg  = arg;
 }
 
-/* body: '$' ve '#' arasi karakterler. */
 static void dispatch_frame(uint8_t *body, uint8_t len) {
     /* lifecycle komutlari hemen etki eder (S.47) */
     if (len == 2 && body[0]=='G' && body[1]=='O') {
         if (cab_state == ST_WAITING) {
             cab_state = ST_ACTIVE;
             ack_pending = 1; ack_code = 0;
-            thermal_reset();            /* B: requested_limit/mask/band sifirla */
-            display_page      = 0;      /* S.40/S.54: GO'da sayfa 0 */
-            rb6_release_flag  = 0;      /* WAITING'de birikmis press'i at */
-            adc_start_conversion();     /* S.15/S.56: cold-start ADC */
-            cabinet_tick_init();        /* S.46: ilk tick 100 ms sonra */
+            thermal_reset();
+            display_page      = 0;
+            rb6_release_flag  = 0;
+            adc_start_conversion();
+            cabinet_tick_init();
         }
         return;
     }
@@ -192,16 +187,14 @@ static void parser_feed(uint8_t b) {
         dispatch_frame(frame_buf, frame_len);
         return;
     }
-    if (frame_len >= FRAME_MAX) {   /* asiri uzun -> bozuk, frame'i iptal et */
+    if (frame_len >= FRAME_MAX) {
         collecting = 0;
         return;
     }
     frame_buf[frame_len++] = b;
 }
 
-/* ======================================================================
- * 6) FRAME TX  (ACK / STS)
- * ====================================================================== */
+/* ---- 6) Frame TX (ACK / STS) ---- */
 static void send_ack(uint8_t code) {
     char buf[8];
     sprintf(buf, "$ACK%02u#", (unsigned)code);
@@ -212,7 +205,6 @@ static void send_sts(void) {
     char buf[16];
     uint16_t adc;
 
-    /* adc_last 16-bit; ADC ISR'ye karsi atomik oku (thermal.h notu) */
     PIE1bits.ADIE = 0;
     adc = adc_last;
     PIE1bits.ADIE = 1;
@@ -223,18 +215,14 @@ static void send_sts(void) {
     for (uint8_t i = 0; buf[i]; i++) uart_write_byte((uint8_t)buf[i]);
 }
 
-/* ======================================================================
- * 7) CABINET TICK  (Algorithm 1)
- * ====================================================================== */
+/* ---- 7) Cabinet tick (Algorithm 1) ---- */
 static void cabinet_tick(void) {
-    /* Parser $END#'i tick'ten once isleyebilir; o durumda hicbir sey
-     * yapmadan ve TX etmeden cik (Algorithm 1, erken donus). */
     if (cab_state != ST_ACTIVE) return;
 
     switch (pend_kind) {
         case CMD_CON: {
             uint8_t bit = (uint8_t)(1u << pend_arg);
-            if (!(connected_mask & bit)) {       /* idempotent ise ACK yok */
+            if (!(connected_mask & bit)) {
                 connected_mask |= bit;
                 ack_pending = 1; ack_code = 1;
             }
@@ -258,10 +246,10 @@ static void cabinet_tick(void) {
     }
     pend_kind = CMD_NONE;
 
-    thermal_update();           /* B: yeni ADC sonucunu banda cevir */
-    adc_tick();                 /* B: 500 ms cadence sayaci */
-    display_process_button();   /* C: RB6 release -> sayfa toggle */
-    display_update_buffer();    /* C: aktif sayfayi buffer'a yaz */
+    thermal_update();
+    adc_tick();
+    display_process_button();
+    display_update_buffer();
 
     if (ack_pending) {
         send_ack(ack_code);
@@ -271,15 +259,9 @@ static void cabinet_tick(void) {
     }
 }
 
-/* ======================================================================
- * 8) INTERRUPT SERVICE ROUTINE
- * Tek seviye - high/low priority bolunmemeli: display mux cok sik fire
- * eder, bolersek RX byte kaybedilir.
- * ====================================================================== */
+/* ---- 8) ISR ---- */
 void __interrupt() isr(void) {
-    /* --- EUSART RX --- */
     if (PIE1bits.RC1IE && PIR1bits.RC1IF) {
-        /* FERR biti RCREG okunmadan ONCE okunmali (okuma onu temizler) */
         uint8_t ferr = RCSTA1bits.FERR;
         if (RCSTA1bits.OERR) {          /* overrun: CREN cevir, FIFO bosalt */
             RCSTA1bits.CREN = 0;
@@ -291,7 +273,6 @@ void __interrupt() isr(void) {
         }
     }
 
-    /* --- EUSART TX --- */
     if (PIE1bits.TX1IE && PIR1bits.TX1IF) {
         uint8_t byte;
         if (rb_pop(&tx_ring, &byte)) {
@@ -301,10 +282,7 @@ void __interrupt() isr(void) {
         }
     }
 
-    /* --- ADC tamamlandi (Uye B) --- */
     if (PIE1bits.ADIE && PIR1bits.ADIF) {
-        /* Sag-hizali sonuc: ADRESL once okunmali (donanim ADRESH'i
-         * ADRESL okunana kadar dondurur). */
         uint8_t lo = ADRESL;
         uint8_t hi = ADRESH & 0x03u;
         adc_last  = (uint16_t)lo | ((uint16_t)hi << 8u);
@@ -312,7 +290,6 @@ void __interrupt() isr(void) {
         PIR1bits.ADIF = 0;
     }
 
-    /* --- Timer0: 100 ms tick --- */
     if (INTCONbits.TMR0IE && INTCONbits.TMR0IF) {
         TMR0H = T0_RELOAD_H;
         TMR0L = T0_RELOAD_L;
@@ -320,33 +297,28 @@ void __interrupt() isr(void) {
         tick_flag = 1;
     }
 
-    /* --- Timer1: display multiplex (Uye C) --- */
     if (PIE1bits.TMR1IE && PIR1bits.TMR1IF) {
-        display_timer1_handler();   /* TMR1IF'i kendi temizler */
+        display_timer1_handler();
     }
 
-    /* --- RB6 interrupt-on-change (Uye C) --- */
     if (INTCONbits.RBIE && INTCONbits.RBIF) {
-        rb6_ioc_handler();          /* RBIF'i kendi temizler */
+        rb6_ioc_handler();
     }
 }
 
-/* ======================================================================
- * 9) MAIN
- * ====================================================================== */
+/* ---- 9) Main ---- */
 void main(void) {
     eusart_init();
-    adc_init();             /* B */
-    display_init();         /* C */
-    timer1_display_init();  /* C */
-    rb6_ioc_init();         /* C */
-    /* cabinet_tick_init() $GO# kabul edilince cagrilir */
+    adc_init();
+    display_init();
+    timer1_display_init();
+    rb6_ioc_init();
 
-    RCONbits.IPEN   = 0;    /* tek seviyeli interrupt */
+    RCONbits.IPEN   = 0;
     INTCONbits.PEIE = 1;
     INTCONbits.GIE  = 1;
 
-    for (;;) {
+    while (1) {
         while (uart_rx_available()) {
             uint8_t byte;
             uart_read_byte(&byte);
