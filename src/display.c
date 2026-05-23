@@ -70,9 +70,7 @@ void display_update_buffer(void)
     }
 
     if (display_page == 0) {
-        PIE1bits.ADIE = 0;
         uint16_t value = adc_last;
-        PIE1bits.ADIE = 1;
 
         if (value > 1023) {
             value = 1023;
