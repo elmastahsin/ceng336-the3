@@ -3,7 +3,6 @@
 
 #include <stdint.h>
 
-// Owned by display.c; the cabinet resets these at $GO# acceptance.
 extern volatile uint8_t display_page;
 extern volatile uint8_t rb6_release_flag;
 
